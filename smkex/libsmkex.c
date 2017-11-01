@@ -15,6 +15,8 @@
 #include <linux/tcp.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <fcntl.h>
+#include <stdarg.h>
 
 #include <openssl/err.h>
 #include <openssl/ssl.h>
@@ -22,6 +24,17 @@
 #include <openssl/rand.h>
 
 #define SMKEX_MAX_FD    1024
+#define SO_SMKEX_NOCRYPT 0xA001
+
+#define DEBUG 1
+
+#define POLLCONN    0x800
+
+FILE *dbfile;
+#define dbgtext(x)\
+  fprintf(dbfile, (x));
+
+
 
 int select_subflow(int oldflags, int index) {
     int newflags = oldflags;
@@ -48,7 +61,42 @@ struct mp_socket_s {
         unsigned char* remote_pub_key;
         unsigned int remote_pub_key_length;
     } session;
+
+    int connected; // for client socket
+    int accepted;  // for server socket
+    //int req_noblock; // signal fcntl(...,O_NONBLOCK) request
+    int no_crypt; // to signal that we want a standard TCP connection (no encryption)
+    int do_session_attack; // used to simulate attacker
 } mp_sockets[SMKEX_MAX_FD];
+
+void init_mp_socket_s(struct mp_socket_s *elem){
+    elem->used = 1;
+    elem->session_key = NULL;
+    elem->iv = NULL;
+    elem->recv_buffer = NULL;
+    elem->recv_buffer_cursor = NULL;
+    elem->recv_stored_ppkt = NULL;
+    elem->recv_remaining = 0;
+    memset(&elem->session, 0, sizeof(elem->session)); 
+}
+
+void free_and_null(void **ptr){
+    if (*ptr != NULL){
+        free(*ptr);
+        *ptr=NULL;
+    }
+}
+
+void reset_mp_socket_s(struct mp_socket_s *elem){
+    /*free_and_null((void **)&(elem->session.local_nonce));
+    free_and_null((void **)&(elem->session.local_pub_key));
+    free_and_null((void **)&(elem->session.remote_nonce));
+    free_and_null((void **)&(elem->session.remote_pub_key));
+    free_and_null((void **)&(elem->session_key));
+    free_and_null((void **)&(elem->iv));
+    free_and_null((void **)&(elem->recv_buffer));*/
+    //memset(elem, 0, sizeof(struct mp_socket_s));
+}
 
 int initialized = 0;
 
@@ -79,7 +127,7 @@ EC_KEY* __new_key_pair(void) {
 }
 
 
-int __send_local_key(int sockfd, EC_KEY* key) {
+int __send_local_key(int sockfd, EC_KEY* key, int ids) {
     ssize_t (*original_send)(int, const void*, size_t, int) = dlsym(RTLD_NEXT, "send");
 
     const EC_GROUP* ec_group = EC_KEY_get0_group(key);
@@ -135,10 +183,40 @@ int __send_local_key(int sockfd, EC_KEY* key) {
     ppkt->length = pub_key_size + SESSION_NONCE_LENGTH;
     ppkt->send = original_send;
 
+#if DEBUG
+    fprintf(stderr, "Sending local key on socket %d, subflow %d\n",
+        sockfd, ids);
+#endif
     // Public keys are always sent on the master subflow
-    rc = smkex_pkt_send(ppkt, sockfd, select_subflow(0, 1));
+    rc = smkex_pkt_send(ppkt, sockfd, select_subflow(0, ids));
     if (rc < 0) {
         fprintf(stderr, "Error: Could not send our public key.\n");
+        return -1;
+    }
+
+    return 0;
+}
+
+int __send_dummy(int sockfd) {
+    ssize_t (*original_send)(int, const void*, size_t, int) = dlsym(RTLD_NEXT, "send");
+
+    // Prepare message
+    smkex_pkt* ppkt = smkex_pkt_allocate(1);
+    if (ppkt == NULL) {
+        fprintf(stderr, "Error: could not allocate memory for server pkt.\n");
+        return -1;
+    }
+
+    memset(ppkt->value, 0, 1);
+
+    ppkt->type = TLV_TYPE_DUMMY;
+    ppkt->length = 1;
+    ppkt->send = original_send;
+
+    // Send on any flow
+    int rc = smkex_pkt_send(ppkt, sockfd, 0);
+    if (rc < 0) {
+        fprintf(stderr, "Error: Could not send dummy packet.\n");
         return -1;
     }
 
@@ -150,8 +228,9 @@ int __send_local_key(int sockfd, EC_KEY* key) {
  * Format is:
  * [ local_nonce | local_pub_key | remote_nonce | remote_pub_key ]
  */
-int __send_session_info(int sockfd) {
+int __send_session_info(int sockfd, int ids) {
     ssize_t (*original_send)(int, const void*, size_t, int) = dlsym(RTLD_NEXT, "send");
+    int (*original_setsockopt)(int, int, int, const void*, socklen_t) = dlsym(RTLD_NEXT, "setsockopt");
 
     // Build session info string
     size_t session_length = 2 * SESSION_NONCE_LENGTH +
@@ -192,6 +271,9 @@ int __send_session_info(int sockfd) {
     // Encrypt using session key (TODO: unsafe, update IV after each encryption)
     int rc = mp_aesgcm_encrypt(session, session_length, mp_sockets[sockfd].session_key,
             mp_sockets[sockfd].iv, ppkt->value, &ppkt->length);
+    
+    //free(session);
+    
     if (rc < 0) {
         fprintf(stderr, "Error: aesgcm encryption failed.\n");
         return -1;
@@ -201,29 +283,23 @@ int __send_session_info(int sockfd) {
     ppkt->type = TLV_TYPE_DH;
     ppkt->send = original_send;
 
-
-    // Block while waiting for slave subflows to be ready
-    int slave_count = 2;
-    rc = setsockopt(sockfd, IPPROTO_TCP, MPTCP_SET_SUB_EST_THRESHOLD, &slave_count,
-        sizeof(int));
-    if (rc < 0) {
-        fprintf(stderr, "Error: could not set slave threshold.\n");
-        return -1;
+    // Perform hack on first byte of session_info data if we are
+    // simulating an attacker
+    if(mp_sockets[sockfd].do_session_attack)
+    {
+      fprintf(stderr, "[server] Hacking session info value...\n");
+      ppkt->value[3] ^= 0xAA;
     }
 
-    // Wait using poll
-    struct pollfd fds[1];
-    memset(fds, 0, sizeof(struct pollfd));
-    fds[0].fd = sockfd;
-    fds[0].events |= POLLCONN;
-    poll(fds, 1, -1);
-
-    for (int index = 2; index <= slave_count; index++) {
-        rc = smkex_pkt_send(ppkt, sockfd, select_subflow(0, index));
-        if (rc < 0) {
-            fprintf(stderr, "Error: could not send session ciphertext.\n");
-            return -1;
-        }
+#if DEBUG
+    fprintf(stderr, "Sending session info on socket %d, subflow %d\n",
+        sockfd, ids);
+#endif
+    // Send session info on secondary channel
+    rc = smkex_pkt_send(ppkt, sockfd, select_subflow(0, ids));
+    if (rc < 0) {
+        fprintf(stderr, "Error: could not send session ciphertext.\n");
+        return -1;
     }
 
     return 0;
@@ -234,7 +310,7 @@ int __send_session_info(int sockfd) {
  * Remote and local are reversed for clients:
  * [ remote_nonce | remote_pub_key | local_nonce | local_pub_key ]
  */
-int __recv_check_session_info(int sockfd, int flags) {
+int __recv_check_session_info(int sockfd, int ids) {
     ssize_t (*original_recv)(int, void*, size_t, int) = dlsym(RTLD_NEXT, "recv");
 
     smkex_pkt* ppkt = smkex_pkt_allocate(0);
@@ -243,7 +319,13 @@ int __recv_check_session_info(int sockfd, int flags) {
         return -1;
     }
     ppkt->recv = original_recv;
-    int rc = smkex_pkt_recv(ppkt, sockfd, flags);
+#if DEBUG
+    fprintf(stderr, "Receiving session info on socket %d, subflow %d\n",
+        sockfd, ids);
+#endif
+    // TODO: fix this code once kernel code is fixed
+    int rc = smkex_pkt_recv(ppkt, sockfd, 0);  // Just a hack for now, until we solve kernel issue
+    //int rc = smkex_pkt_recv(ppkt, sockfd, select_subflow(0, ids)); // This should be used when kernel code is fine
     if (rc < 0) {
         fprintf(stderr, "Error: could not receive session info packet.\n");
         return -1;
@@ -293,6 +375,9 @@ int __recv_check_session_info(int sockfd, int flags) {
 
     rc = memcmp(cursor, mp_sockets[sockfd].session.local_pub_key,
             mp_sockets[sockfd].session.local_pub_key_length);
+    
+    //free(session_info);
+    
     if (rc != 0) {
         fprintf(stderr, "Local pub key mismsatch.\n");
         return -1;
@@ -302,7 +387,7 @@ int __recv_check_session_info(int sockfd, int flags) {
 }
 
 
-EC_POINT* __recv_remote_key(int sockfd, EC_KEY* key) {
+EC_POINT* __recv_remote_key(int sockfd, EC_KEY* key, int ids) {
     ssize_t (*original_recv)(int, void*, size_t, int) = dlsym(RTLD_NEXT, "recv");
 
     // Get a new message from sockfd
@@ -312,8 +397,14 @@ EC_POINT* __recv_remote_key(int sockfd, EC_KEY* key) {
         return NULL;
     }
 
+#if DEBUG
+    fprintf(stderr, "Receiving remote key on socket %d, subflow %d\n",
+        sockfd, ids);
+#endif
+    // TODO: fix this code once kernel code is fixed
     ppkt->recv = original_recv;
-    int rc = smkex_pkt_recv(ppkt, sockfd, 0);
+    int rc = smkex_pkt_recv(ppkt, sockfd, 0); // Just a hack until we fix kernel issue
+    //int rc = smkex_pkt_recv(ppkt, sockfd, select_subflow(0, ids)); This should be used once kernel code is fixed
     if (rc < 0) {
         fprintf(stderr, "Error: Could not get remote public key.\n");
         return NULL;
@@ -357,26 +448,132 @@ EC_POINT* __recv_remote_key(int sockfd, EC_KEY* key) {
     return remote_pub_key;
 }
 
+int __recv_dummy(int sockfd) {
+    ssize_t (*original_recv)(int, void*, size_t, int) = dlsym(RTLD_NEXT, "recv");
+
+    // Get a new message from sockfd
+    smkex_pkt* ppkt = smkex_pkt_allocate(0);
+    if (ppkt == NULL) {
+        fprintf(stderr, "Error: could not allocate memory for client pkt.\n");
+        return -1;
+    }
+
+    // Get dummy packet on whatever channel is available
+    ppkt->recv = original_recv;
+    int rc = smkex_pkt_recv(ppkt, sockfd, 0);
+    if (rc < 0) {
+        fprintf(stderr, "Error: Could not get dummy packet.\n");
+        return -1;
+    }
+
+    // Discard dummy packet
+    smkex_pkt_free(ppkt);
+
+    return 0;
+}
 
 int connect(int sockfd, const struct sockaddr* address, socklen_t address_len) {
     int (*original_connect)(int, const struct sockaddr*, socklen_t) = dlsym(RTLD_NEXT, "connect");
+    //int (*original_fcntl)(int, int, int) = dlsym(RTLD_NEXT, "fcntl");
+    int (*original_setsockopt)(int, int, int, const void*, socklen_t) = dlsym(RTLD_NEXT, "setsockopt");
+    int (*original_fcntl)(int, int, ...) = dlsym(RTLD_NEXT, "fcntl");
     __initialize();
+    int ids0, ids1;
 
     if (sockfd < 0 || sockfd >= SMKEX_MAX_FD) {
-        printf("Error: unsupported socket fd = %d.\n", sockfd);
+        fprintf(stderr, "Error: unsupported socket fd = %d.\n", sockfd);
         errno = EBADF;
         return -1;
     }
 
+#if DEBUG
+    fprintf(stderr, "libsmkex: starting connect on socket %d\n", sockfd);
+
+    int flags = original_fcntl(sockfd, F_GETFL, 0);
+    fprintf(stderr, "O_NONBLOCK in flags of connect() on libsmkex: %d\n", flags & O_NONBLOCK);
+#endif
+
     int rc = original_connect(sockfd, address, address_len);
     if (rc >= 0) {
-        mp_sockets[sockfd].used = 1;
-        mp_sockets[sockfd].recv_buffer = NULL;
-        mp_sockets[sockfd].recv_buffer_cursor = NULL;
-        mp_sockets[sockfd].recv_stored_ppkt = NULL;
-        mp_sockets[sockfd].recv_remaining = 0;
-        memset(&mp_sockets[sockfd].session, 0, sizeof(mp_sockets[sockfd].session));
+        init_mp_socket_s(&(mp_sockets[sockfd]));
     }
+
+    if (mp_sockets[sockfd].no_crypt)
+    {
+#if DEBUG
+    fprintf(stderr, "libsmkex: connecting without crypto on socket %d\n", sockfd);
+#endif
+      goto connect_no_crypt;
+    }
+
+    // Send dummy packet to force creating two subflows
+    rc = __send_dummy(sockfd);
+    if (rc < 0) {
+        fprintf(stderr, "Error: Could not send dummy packet.\n");
+        return -1;
+    }
+
+    // Block while waiting for slave subflows to be ready
+    int slave_count = 2;
+    rc = original_setsockopt(sockfd, IPPROTO_TCP, MPTCP_SET_SUB_EST_THRESHOLD, &slave_count,
+        sizeof(int));
+    if (rc < 0) {
+        fprintf(stderr, "Error: could not set slave threshold.\n");
+        return -1;
+    }
+
+#if DEBUG
+    fprintf(stderr, "Connect: before poll on socket %d\n", sockfd);
+#endif
+
+    // Wait using poll
+    struct pollfd fds[1];
+    memset(fds, 0, sizeof(struct pollfd));
+    fds[0].fd = sockfd;
+    fds[0].events |= POLLCONN;
+    poll(fds, 1, -1);
+
+#if DEBUG
+    fprintf(stderr, "Connect: after poll on socket %d\n", sockfd);
+    flags = original_fcntl(sockfd, F_GETFL, 0);
+    fprintf(stderr, "O_NONBLOCK in flags of connect() on libsmkex: %d\n", flags & O_NONBLOCK);
+#endif
+
+    // check number of existing subflows (needed next)
+    int cnt_subflows=0;
+    socklen_t len_sockopt=1;
+    rc = getsockopt(sockfd, IPPROTO_TCP, MPTCP_GET_SUB_EST_COUNT, &cnt_subflows, &len_sockopt);
+    if(rc < 0)
+    {
+        fprintf(stderr, "Error: could not retrieve number of MPTCP flows with getsockopt.\n");
+        perror("getsockopt");
+        return -1;
+    }
+#if DEBUG
+    fprintf(stderr, "MPTCP returned %d available subflows\n", cnt_subflows);
+#endif
+
+
+    // Find IDs of subflows
+    struct mptcp_sub_ids *ids;
+    socklen_t ids_len;
+    ids_len = sizeof(struct mptcp_sub_ids) + sizeof(struct mptcp_sub_status) * (cnt_subflows+1);
+    ids = (struct mptcp_sub_ids *)malloc(ids_len);
+    rc = getsockopt(sockfd, IPPROTO_TCP, MPTCP_GET_SUB_IDS, ids, &ids_len);
+    ids0 = ids->sub_status[0].id;
+    ids1 = ids->sub_status[1].id;
+    if(rc < 0)
+    {
+        fprintf(stderr, "Error %d: could not retrieve MPTCP subflow IDs with getsockopt.\n", rc);
+        fprintf(stderr, "errno: %s\n", strerror(errno));
+        perror("getsockopt");
+        //free(ids);
+        return -1;
+    }
+#if DEBUG
+    fprintf(stderr, "MPTCP returned the following IDs for the first two sub-flows: ID1: %d; ID2: %d.\n",
+        ids->sub_status[0].id, ids->sub_status[1].id);
+#endif
 
     // Run ECDH key exchange
     EC_KEY* ec_key = __new_key_pair();
@@ -385,13 +582,15 @@ int connect(int sockfd, const struct sockaddr* address, socklen_t address_len) {
         return -1;
     }
 
-    rc = __send_local_key(sockfd, ec_key);
+    // Public keys sent on the master subflow
+    rc = __send_local_key(sockfd, ec_key, ids0);
     if (rc < 0) {
         fprintf(stderr, "Error: Could not send local public key.\n");
         return -1;
     }
 
-    EC_POINT* remote_pub_key = __recv_remote_key(sockfd, ec_key);
+    // Public keys received on the master subflow
+    EC_POINT* remote_pub_key = __recv_remote_key(sockfd, ec_key, ids0);
     if (remote_pub_key == NULL) {
         fprintf(stderr, "Error: Could not receive remote public key. \n");
         return -1;
@@ -440,37 +639,93 @@ int connect(int sockfd, const struct sockaddr* address, socklen_t address_len) {
             mp_sockets[sockfd].session.remote_pub_key_length);
     printf("\n");
 
-    // Block while waiting for slave subflows to be ready
-    int slave_count = 2;
-    rc = setsockopt(sockfd, IPPROTO_TCP, MPTCP_SET_SUB_EST_THRESHOLD, &slave_count,
-        sizeof(int));
+    // First check number of existing subflows (needed next)
+    cnt_subflows=0;
+    len_sockopt=1;
+    rc = getsockopt(sockfd, IPPROTO_TCP, MPTCP_GET_SUB_EST_COUNT, &cnt_subflows, &len_sockopt);
+    if(rc < 0)
+    {
+        fprintf(stderr, "Error: could not retrieve number of MPTCP flows with getsockopt.\n");
+        perror("getsockopt");
+        return -1;
+    }
+#if DEBUG
+    fprintf(stderr, "MPTCP returned %d available subflows\n", cnt_subflows);
+#endif
+
+
+    // Find IDs of subflows
+    //struct mptcp_sub_ids *ids;
+    //socklen_t ids_len;
+    ids_len = sizeof(struct mptcp_sub_ids) + sizeof(struct mptcp_sub_status) * (cnt_subflows+1);
+    //free(ids);
+    ids = (struct mptcp_sub_ids *)malloc(ids_len);
+    rc = getsockopt(sockfd, IPPROTO_TCP, MPTCP_GET_SUB_IDS, ids, &ids_len);
+    ids0 = ids->sub_status[0].id;
+    ids1 = ids->sub_status[1].id;
+    if(rc < 0)
+    {
+        fprintf(stderr, "Error %d: could not retrieve MPTCP subflow IDs with getsockopt.\n", rc);
+        perror("getsockopt");
+        //free(ids);
+        return -1;
+    }
+#if DEBUG
+    fprintf(stderr, "MPTCP returned the following IDs for the first two sub-flows: ID1: %d; ID2: %d.\n",
+        ids->sub_status[0].id, ids->sub_status[1].id);
+#endif
+
+    // Receive session info on secondary channel
+    rc = __recv_check_session_info(sockfd, ids1);
     if (rc < 0) {
-        fprintf(stderr, "Error: could not set slave threshold.\n");
+        fprintf(stderr, "Error: session info check failed.\n");
         return -1;
     }
 
-    // Wait using poll
-    struct pollfd fds[1];
-    memset(fds, 0, sizeof(struct pollfd));
-    fds[0].fd = sockfd;
-    fds[0].events |= POLLCONN;
-    poll(fds, 1, -1);
+#if DEBUG
+    fprintf(stderr, "Connect: after receiving session info on socket %d\n", sockfd);
+#endif
 
-    for (int index = 2; index <= slave_count; index++) {
-        rc = __recv_check_session_info(sockfd, select_subflow(0, index));
-        if (rc < 0) {
-            fprintf(stderr, "Error: session info check failed.\n");
-            return -1;
-        }
-    }
+connect_no_crypt:
+    mp_sockets[sockfd].connected = 1;
 
+#if DEBUG
+    fprintf(stderr, "libsmkex: finishing connect on socket %d\n", sockfd);
+#endif
+
+    //free(ids);
     return rc;
 }
 
+/*
+ * Bind method for SMKEX.
+ * Used mainly to reproduce an active attacker for some local ports
+ */
+int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen){
+    int (*original_bind)(int , const struct sockaddr*, socklen_t) = dlsym(RTLD_NEXT, "bind");
 
+    // Perform attack if server port is 12345 or 12346 (values below in hton order)
+    if (((struct sockaddr_in*)addr)->sin_port == 14640 || ((struct sockaddr_in*)addr)->sin_port == 14896)
+    {
+      fprintf(stderr, "[server] will perform attack on session info for socket %d\n", sockfd);
+      mp_sockets[sockfd].do_session_attack = 1;
+    }
+    else{
+      mp_sockets[sockfd].do_session_attack = 0;
+    }
+
+    return original_bind(sockfd, addr, addrlen);
+}
+
+/*
+ * Accept method for SMKEX.
+ * This performs the SMKEX protocol before releasing the client socket.
+ */
 int accept(int sockfd, struct sockaddr* addr, socklen_t* addrlen) {
     int (*original_accept)(int, struct sockaddr*, socklen_t*) = dlsym(RTLD_NEXT, "accept");
+    int (*original_setsockopt)(int, int, int, const void*, socklen_t) = dlsym(RTLD_NEXT, "setsockopt");
     __initialize();
+    int ids0, ids1;
 
     if (sockfd < 0 || sockfd >= SMKEX_MAX_FD) {
         fprintf(stderr, "Error: unsupported socket fd = %d.\n", sockfd);
@@ -478,15 +733,91 @@ int accept(int sockfd, struct sockaddr* addr, socklen_t* addrlen) {
         return -1;
     }
 
+#if DEBUG
+    fprintf(stderr, "libsmkex: starting accept on socket %d\n", sockfd);
+#endif
+
     int accepted_fd = original_accept(sockfd, addr, addrlen);
     if (accepted_fd >= 0) {
-        mp_sockets[accepted_fd].used = 1;
-        mp_sockets[accepted_fd].recv_buffer = NULL;
-        mp_sockets[accepted_fd].recv_buffer_cursor = NULL;
-        mp_sockets[accepted_fd].recv_stored_ppkt = NULL;
-        mp_sockets[accepted_fd].recv_remaining = 0;
-        memset(&mp_sockets[sockfd].session, 0, sizeof(mp_sockets[sockfd].session));
+        init_mp_socket_s(&(mp_sockets[accepted_fd]));
+        mp_sockets[accepted_fd].no_crypt = mp_sockets[sockfd].no_crypt;
     }
+
+
+    if (mp_sockets[sockfd].no_crypt)
+    {
+#if DEBUG
+      fprintf(stderr, "libsmkex: accepting without crypto on socket %d\n", accepted_fd);
+#endif
+      goto accept_no_crypt;
+    }
+
+    // Receive dummy packet to force creating two subflows
+    int rc = __recv_dummy(accepted_fd);
+    if (rc < 0) {
+        fprintf(stderr, "Error: Could not receive dummy packet.\n");
+        return -1;
+    }
+
+    // Block while waiting for slave subflows to be ready
+    int slave_count = 2;
+    rc = original_setsockopt(accepted_fd, IPPROTO_TCP, MPTCP_SET_SUB_EST_THRESHOLD,
+        &slave_count, sizeof(int));
+    if (rc < 0) {
+        fprintf(stderr, "Error: could not set slave threshold.\n");
+        return -1;
+    }
+
+#if DEBUG
+    fprintf(stderr, "accept: before poll on socket %d\n", accepted_fd);
+#endif
+
+    // Wait using poll
+    struct pollfd fds[1];
+    memset(fds, 0, sizeof(struct pollfd));
+    fds[0].fd = accepted_fd;
+    fds[0].events |= POLLCONN;
+    poll(fds, 1, -1);
+
+#if DEBUG
+    fprintf(stderr, "accept: after poll on socket %d\n", accepted_fd);
+#endif
+
+    // check number of existing subflows (needed next)
+    int cnt_subflows=0;
+    socklen_t len_sockopt=1;
+    rc = getsockopt(accepted_fd, IPPROTO_TCP, MPTCP_GET_SUB_EST_COUNT,
+                    &cnt_subflows, &len_sockopt);
+    if(rc < 0)
+    {
+        fprintf(stderr, "Error: could not retrieve number of MPTCP flows with getsockopt.\n");
+        perror("getsockopt");
+        return -1;
+    }
+#if DEBUG
+    fprintf(stderr, "MPTCP returned %d available subflows\n", cnt_subflows);
+#endif
+
+
+    // Find IDs of subflows
+    struct mptcp_sub_ids *ids;
+    socklen_t ids_len;
+    ids_len = sizeof(struct mptcp_sub_ids) + sizeof(struct mptcp_sub_status) * (cnt_subflows+1);
+    ids = (struct mptcp_sub_ids *)malloc(ids_len);
+    rc = getsockopt(accepted_fd, IPPROTO_TCP, MPTCP_GET_SUB_IDS, ids, &ids_len);
+    ids0 = ids->sub_status[0].id;
+    ids1 = ids->sub_status[1].id;
+    if(rc < 0)
+    {
+        fprintf(stderr, "Error %d: could not retrieve MPTCP subflow IDs with getsockopt.\n", rc);
+        fprintf(stderr, "errno: %s\n", strerror(errno));
+        perror("getsockopt");
+        return -1;
+    }
+#if DEBUG
+    fprintf(stderr, "MPTCP returned the following IDs for the first two sub-flows: ID1: %d; ID2: %d.\n",
+        ids->sub_status[0].id, ids->sub_status[1].id);
+#endif
 
     // Perform DH key exchange
     EC_KEY* ec_key = __new_key_pair();
@@ -495,13 +826,16 @@ int accept(int sockfd, struct sockaddr* addr, socklen_t* addrlen) {
         return -1;
     }
 
-    int rc = __send_local_key(accepted_fd, ec_key);
+    // Public keys sent on the master subflow
+    rc = __send_local_key(accepted_fd, ec_key, ids0);
     if (rc < 0) {
         fprintf(stderr, "Error: Could not send local public key.\n");
         return -1;
     }
 
-    EC_POINT* remote_pub_key = __recv_remote_key(accepted_fd, ec_key);
+
+    // Public keys received on the master subflow
+    EC_POINT* remote_pub_key = __recv_remote_key(accepted_fd, ec_key, ids0);
     if (remote_pub_key == NULL) {
         fprintf(stderr, "Error: Could not receive remote public key. \n");
         return -1;
@@ -551,12 +885,34 @@ int accept(int sockfd, struct sockaddr* addr, socklen_t* addrlen) {
             mp_sockets[accepted_fd].session.remote_pub_key_length);
     printf("\n");
 
+
+#if DEBUG
+    fprintf(stderr, "Accept: before send_session_info() on socket %d\n", accepted_fd);
+#endif
+
+    // Set flag to perform hack on first byte of session_info data if we are
+    // simulating an attacker
+    if(mp_sockets[sockfd].do_session_attack)
+      mp_sockets[accepted_fd].do_session_attack = 1;
+    else
+      mp_sockets[accepted_fd].do_session_attack = 0;
     
-    rc = __send_session_info(accepted_fd);
+    rc = __send_session_info(accepted_fd, ids1);
     if (rc < 0) {
         fprintf(stderr, "Error: could not send session info.\n");
         return -1;
     }
+
+#if DEBUG
+    fprintf(stderr, "Accept: after send_session_info() on socket %d\n", accepted_fd);
+#endif
+
+accept_no_crypt:
+    mp_sockets[accepted_fd].accepted = 1;
+
+#if DEBUG
+    fprintf(stderr, "libsmkex: finishing accept on socket %d\n", sockfd);
+#endif
 
     return accepted_fd;
 }
@@ -570,6 +926,18 @@ ssize_t send(int sockfd, const void* buf, size_t len, int flags) {
         fprintf(stderr, "Error: unsupported socket fd = %d.\n", sockfd);
         errno = EBADF;
         return -1;
+    }
+
+#if DEBUG
+    fprintf(stderr, "libsmkex: starting send\n");
+#endif
+
+    if(mp_sockets[sockfd].no_crypt)
+    {
+#if DEBUG
+      fprintf(stderr, "libsmkex: sending without crypto\n");
+#endif
+      return original_send(sockfd, buf, len, flags);
     }
 
     // Encrypt
@@ -594,12 +962,25 @@ ssize_t recv(int sockfd, void* buf, size_t len, int flags) {
     ssize_t (*original_recv)(int, void*, size_t, int) = dlsym(RTLD_NEXT, "recv");
     __initialize();
 
+    int rc;
+
     if (sockfd < 0 || sockfd >= SMKEX_MAX_FD) {
         fprintf(stderr, "Error: unsupported socket fd = %d.\n", sockfd);
         errno = EBADF;
         return -1;
     }
 
+#if DEBUG
+    fprintf(stderr, "libsmkex: starting recv on socket %d\n", sockfd);
+#endif
+
+    if(mp_sockets[sockfd].no_crypt)
+    {
+#if DEBUG
+      fprintf(stderr, "libsmkex: receiving without crypto on socket %d\n", sockfd);
+#endif
+      return original_recv(sockfd, buf, len, flags);
+    }
 
     if (mp_sockets[sockfd].recv_remaining == 0) {
         // App requested bytes, but we have none available
@@ -609,8 +990,12 @@ ssize_t recv(int sockfd, void* buf, size_t len, int flags) {
             return -1;
         }
         ppkt->recv = original_recv;
-        smkex_pkt_recv(ppkt, sockfd, flags);
-
+        rc = smkex_pkt_recv(ppkt, sockfd, flags);
+        if (rc <= 0) {
+            mp_sockets[sockfd].recv_remaining = 0;
+            return rc; // Could be a non-blocking socket
+        }
+        
         if (ppkt->type != TLV_TYPE_DATA) {
             // Bad type means we cannot accept this TLV
             fprintf(stderr, "Error: received type = %d, was expecting %d.\n", ppkt->type, TLV_TYPE_DATA);
@@ -660,6 +1045,7 @@ ssize_t recv(int sockfd, void* buf, size_t len, int flags) {
 int close(int fd) {
     int (*original_close)(int) = dlsym(RTLD_NEXT, "close");
     int initialize();
+    fprintf(stderr, "Calling close");
 
     if (fd < 0 || fd >= SMKEX_MAX_FD) {
         fprintf(stderr, "Error: unsupported fd = %d.\n", fd);
@@ -670,6 +1056,76 @@ int close(int fd) {
     int rc = original_close(fd);
     if (mp_sockets[fd].used == 1 && rc >= 0) {
         mp_sockets[fd].used = 0;
+        reset_mp_socket_s(&(mp_sockets[fd]));
     }
+    
     return rc;
+}
+
+
+int fcntl(int sockfd, int cmd, ...) {
+    int (*original_fcntl)(int, int, ...) = dlsym(RTLD_NEXT, "fcntl");
+    int rc;
+    va_list ap;
+    int flags;
+
+    __initialize();
+
+    if (sockfd < 0 || sockfd >= SMKEX_MAX_FD) {
+        fprintf(stderr, "Error: unsupported socket fd = %d.\n", sockfd);
+        errno = EBADF;
+        return -1;
+    }
+
+    va_start(ap, cmd);
+    flags = va_arg(ap, int);
+    va_end(ap);
+    if (-1 == (flags = original_fcntl(sockfd, F_GETFL, 0))) {
+      flags = 0;
+    }
+    int req_noblock = flags & O_NONBLOCK;
+
+#if DEBUG
+    fprintf(stderr, "fcntl: cmd %d, flags %d on socket %d\n",
+        cmd, flags, sockfd);
+    if (req_noblock > 0)
+      fprintf(stderr, "fcntl: requesting O_NONBLOCK on socket %d\n", sockfd);
+#endif
+
+
+    return original_fcntl(sockfd, cmd, flags);
+}
+
+int setsockopt(int sockfd, int level, int option_name, const void *option_value, socklen_t option_len)
+{
+    int (*original_setsockopt)(int, int, int, const void*, socklen_t) = dlsym(RTLD_NEXT, "setsockopt");
+
+    __initialize();
+
+    if (sockfd < 0 || sockfd >= SMKEX_MAX_FD) {
+        fprintf(stderr, "Error: unsupported socket fd = %d.\n", sockfd);
+        errno = EBADF;
+        return -1;
+    }
+
+#if DEBUG
+    fprintf(stderr, "setsockopt: level %d, option_name %d on socket %d\n",
+        level, option_name, sockfd);
+#endif
+
+    // Check if we are being required to stop crypto.
+    if (option_name == SO_SMKEX_NOCRYPT)
+    {
+#if DEBUG
+      fprintf(stderr,
+          "Setsockopt: Received request to stop crypto on socket %d\n", sockfd);
+#endif
+      mp_sockets[sockfd].no_crypt = 1;
+      return 0;
+    }
+    else
+    {
+      return original_setsockopt(sockfd, level, option_name, option_value, option_len);
+    }
+
 }
