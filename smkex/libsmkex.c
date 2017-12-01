@@ -27,6 +27,7 @@
 #define SO_SMKEX_NOCRYPT 0xA001
 
 #define DEBUG 0
+#define SMKEX 0
 
 #define POLLCONN    0x800
 
@@ -507,6 +508,7 @@ int connect(int sockfd, const struct sockaddr* address, socklen_t address_len) {
       goto connect_no_crypt;
     }
 
+#if SMKEX // Don't care about subflows, blocking or dummy packets
     // Send dummy packet to force creating two subflows
     rc = __send_dummy(sockfd);
     if (rc < 0) {
@@ -573,6 +575,7 @@ int connect(int sockfd, const struct sockaddr* address, socklen_t address_len) {
     fprintf(stderr, "MPTCP returned the following IDs for the first two sub-flows: ID1: %d; ID2: %d.\n",
         ids->sub_status[0].id, ids->sub_status[1].id);
 #endif
+#endif //SMKEX
 
     // Run ECDH key exchange
     EC_KEY* ec_key = __new_key_pair();
@@ -638,6 +641,8 @@ int connect(int sockfd, const struct sockaddr* address, socklen_t address_len) {
             mp_sockets[sockfd].session.remote_pub_key_length);
     printf("\n");
 
+	// Only run the code below in SMKEX exchanges
+#if SMKEX
     // First check number of existing subflows (needed next)
     cnt_subflows=0;
     len_sockopt=1;
@@ -668,7 +673,7 @@ int connect(int sockfd, const struct sockaddr* address, socklen_t address_len) {
 #if DEBUG
     fprintf(stderr, "MPTCP returned the following IDs for the first two sub-flows: ID1: %d; ID2: %d.\n",
         ids->sub_status[0].id, ids->sub_status[1].id);
-#endif
+#endif // DEBUG
 
     // Receive session info on secondary channel
     rc = __recv_check_session_info(sockfd, ids1);
@@ -676,6 +681,7 @@ int connect(int sockfd, const struct sockaddr* address, socklen_t address_len) {
         fprintf(stderr, "Error: session info check failed.\n");
         return -1;
     }
+#endif // SMKEX
 
 #if DEBUG
     fprintf(stderr, "Connect: after receiving session info on socket %d\n", sockfd);
@@ -758,6 +764,7 @@ int accept(int sockfd, struct sockaddr* addr, socklen_t* addrlen) {
         return -1;
     }
 
+#if SMKEX // We don't care about subflows or synchronization
     // Block while waiting for slave subflows to be ready
     int slave_count = 2;
     rc = original_setsockopt(accepted_fd, IPPROTO_TCP, MPTCP_SET_SUB_EST_THRESHOLD,
@@ -816,6 +823,7 @@ int accept(int sockfd, struct sockaddr* addr, socklen_t* addrlen) {
     fprintf(stderr, "MPTCP returned the following IDs for the first two sub-flows: ID1: %d; ID2: %d.\n",
         ids->sub_status[0].id, ids->sub_status[1].id);
 #endif
+#endif // SMKEX
 
     // Perform DH key exchange
     EC_KEY* ec_key = __new_key_pair();
@@ -884,6 +892,7 @@ int accept(int sockfd, struct sockaddr* addr, socklen_t* addrlen) {
     printf("\n");
 
 
+#if SMKEX // Don't send session info when running standard DH
 #if DEBUG
     fprintf(stderr, "Accept: before send_session_info() on socket %d\n", accepted_fd);
 #endif
@@ -904,6 +913,7 @@ int accept(int sockfd, struct sockaddr* addr, socklen_t* addrlen) {
 #if DEBUG
     fprintf(stderr, "Accept: after send_session_info() on socket %d\n", accepted_fd);
 #endif
+#endif // SMKEX
 
 accept_no_crypt:
     mp_sockets[accepted_fd].accepted = 1;
