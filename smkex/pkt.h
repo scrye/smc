@@ -6,7 +6,8 @@
 
 enum {
   TLV_TYPE_DH = 0,
-  TLV_TYPE_DATA = 1
+  TLV_TYPE_DATA = 1,
+  TLV_TYPE_DUMMY = 2
 };
 
 typedef struct {

@@ -4,6 +4,8 @@
 #include <stdio.h>
 #include <arpa/inet.h>
 
+#define DEBUG 0
+
 smkex_pkt* __smkex_pkt_new(void) {
     smkex_pkt* ppkt = malloc(sizeof(smkex_pkt));
     if (ppkt == NULL) {
@@ -57,7 +59,13 @@ ssize_t smkex_pkt_send(smkex_pkt* ppkt, int sockfd, int flags) {
     size_t bytes_sent = 0;
     size_t bytes_to_send = ppkt->header_size + ppkt->length;
     while (bytes_sent != bytes_to_send) {
+#if DEBUG
+        fprintf(stderr, "smkex_pkt_send: before send on socket %d\n", sockfd);
+#endif
         ssize_t count = ppkt->send(sockfd, buffer + bytes_sent, bytes_to_send - bytes_sent, flags);
+#if DEBUG
+        fprintf(stderr, "smkex_pkt_send: after send on socket %d. count = %ld\n", sockfd, count);
+#endif
         if (count < 0) {
             perror("send");
             return count;
@@ -79,14 +87,24 @@ ssize_t smkex_pkt_recv(smkex_pkt* ppkt, int sockfd, int flags) {
 
     size_t bytes_recvd = 0;
     while (bytes_recvd != header_size) {
+#if DEBUG
+        fprintf(stderr, "smkex_pkt_recv: before recv header on socket %d\n", sockfd);
+#endif
         ssize_t count = ppkt->recv(sockfd, &header[bytes_recvd], header_size - bytes_recvd, flags);
-        if (count < 0) {
+#if DEBUG
+        fprintf(stderr, "smkex_pkt_recv: after recv header on socket %d. count = %ld\n", sockfd, count);
+#endif
+        if (count <= 0) {
             perror("recv");
             return count;
         }
 
         bytes_recvd += count;
     }
+
+#if DEBUG
+    fprintf(stderr, "smkex_pkt_recv: after receiving header on socket %d\n", sockfd);
+#endif
 
     // Extract header fields
     ppkt->length = ntohl(*(uint32_t*)&header[sizeof(ppkt->__raw_smkex_ppkt->type)]);
@@ -100,12 +118,21 @@ ssize_t smkex_pkt_recv(smkex_pkt* ppkt, int sockfd, int flags) {
     ppkt->value = ppkt->__raw_smkex_ppkt->value;
     memcpy(ppkt->__raw_smkex_ppkt, &header[0], header_size);
 
+#if DEBUG
+    fprintf(stderr, "smkex_pkt_recv: before reading data on socket %d\n", sockfd);
+#endif
     // Receive raw packet
     unsigned char* buffer = ppkt->value;
     bytes_recvd = 0;
     while (bytes_recvd != ppkt->length) {
+#if DEBUG
+        fprintf(stderr, "smkex_pkt_recv: before recv data on socket %d\n", sockfd);
+#endif
         ssize_t count = ppkt->recv(sockfd, buffer + bytes_recvd, ppkt->length - bytes_recvd, flags);
-        if (count < 0) {
+#if DEBUG
+        fprintf(stderr, "smkex_pkt_recv: after recv data on socket %d. count = %ld\n", sockfd, count);
+#endif
+        if (count <= 0) {
             perror("recv");
             return count;
         }

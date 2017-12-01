@@ -109,6 +109,8 @@ int main(int argc, char* argv[]) {
             my_send(connect_fd, buf, bytes_read);
         }
         lseek(file_fd, 0, SEEK_SET);
+
+        close(connect_fd);
     }
 
     close(listen_fd);
