@@ -726,6 +726,7 @@ int accept(int sockfd, struct sockaddr* addr, socklen_t* addrlen) {
     int (*original_setsockopt)(int, int, int, const void*, socklen_t) = dlsym(RTLD_NEXT, "setsockopt");
     __initialize();
     int ids0, ids1;
+	int rc;
 
     if (sockfd < 0 || sockfd >= SMKEX_MAX_FD) {
         fprintf(stderr, "Error: unsupported socket fd = %d.\n", sockfd);
@@ -757,14 +758,14 @@ int accept(int sockfd, struct sockaddr* addr, socklen_t* addrlen) {
       goto accept_no_crypt;
     }
 
+#if SMKEX // We don't care about subflows, synchronization or dummy packets
     // Receive dummy packet to force creating two subflows
-    int rc = __recv_dummy(accepted_fd);
+    rc = __recv_dummy(accepted_fd);
     if (rc < 0) {
         fprintf(stderr, "Error: Could not receive dummy packet.\n");
         return -1;
     }
 
-#if SMKEX // We don't care about subflows or synchronization
     // Block while waiting for slave subflows to be ready
     int slave_count = 2;
     rc = original_setsockopt(accepted_fd, IPPROTO_TCP, MPTCP_SET_SUB_EST_THRESHOLD,
