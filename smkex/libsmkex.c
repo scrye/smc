@@ -612,9 +612,11 @@ int connect(int sockfd, const struct sockaddr* address, socklen_t address_len) {
     }
 
     // TODO DEBUG
+	/*
     printf("Key = ");
     hexdump(mp_sockets[sockfd].session_key, SESSION_KEY_LENGTH);
     printf("\n");
+	*/
     memset(mp_sockets[sockfd].session_key, 0, SESSION_KEY_LENGTH);
 
     mp_sockets[sockfd].iv = malloc(SESSION_IV_LENGTH);
@@ -625,6 +627,7 @@ int connect(int sockfd, const struct sockaddr* address, socklen_t address_len) {
     memset(mp_sockets[sockfd].iv, 0, SESSION_IV_LENGTH);
 
     // TODO DEBUG
+	/*
     printf("Session local nonce = ");
     hexdump(mp_sockets[sockfd].session.local_nonce, SESSION_NONCE_LENGTH);
     printf("\n");
@@ -640,6 +643,7 @@ int connect(int sockfd, const struct sockaddr* address, socklen_t address_len) {
     hexdump(mp_sockets[sockfd].session.remote_pub_key,
             mp_sockets[sockfd].session.remote_pub_key_length);
     printf("\n");
+	*/
 
 	// Only run the code below in SMKEX exchanges
 #if SMKEX
@@ -862,9 +866,11 @@ int accept(int sockfd, struct sockaddr* addr, socklen_t* addrlen) {
     }
 
     // TODO DEBUG
+	/*
     printf("Key = ");
     hexdump(mp_sockets[accepted_fd].session_key, SESSION_KEY_LENGTH);
     printf("\n");
+	*/
     memset(mp_sockets[accepted_fd].session_key, 0, SESSION_KEY_LENGTH);
 
 
@@ -876,6 +882,7 @@ int accept(int sockfd, struct sockaddr* addr, socklen_t* addrlen) {
     memset(mp_sockets[accepted_fd].iv, 0, SESSION_IV_LENGTH);
 
     // TODO DEBUG
+	/*
     printf("Session local nonce = ");
     hexdump(mp_sockets[accepted_fd].session.local_nonce, SESSION_NONCE_LENGTH);
     printf("\n");
@@ -891,6 +898,7 @@ int accept(int sockfd, struct sockaddr* addr, socklen_t* addrlen) {
     hexdump(mp_sockets[accepted_fd].session.remote_pub_key,
             mp_sockets[accepted_fd].session.remote_pub_key_length);
     printf("\n");
+	*/
 
 
 #if SMKEX // Don't send session info when running standard DH

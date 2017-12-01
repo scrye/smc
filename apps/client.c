@@ -67,15 +67,20 @@ int main(int argc, char* argv[]) {
     server_addr.sin_port = htons(server_port);
 
     // Connect
+	struct timeval begin, end;
+	gettimeofday(&begin, NULL);
     ret = connect(client_sockfd, (struct sockaddr *) &server_addr, sizeof(server_addr));
     CHECK(ret >= 0, "connect");
-    printf("[client] Connected to %d\n", server_port);
+	gettimeofday(&end, NULL);
+	unsigned long long duration = 1000 * (end.tv_sec - begin.tv_sec) + (end.tv_usec - begin.tv_usec);
+	printf("%12llu\n", duration);
+    //printf("[client] Connected to %d\n", server_port);
 
     // Recv file size
     uint32_t file_size, file_size_net;
     my_receive(client_sockfd, (char*)&file_size_net, sizeof(file_size_net));
     file_size = ntohl(file_size_net);
-    printf("[client] Got file size: %u\n", file_size);
+    //printf("[client] Got file size: %u\n", file_size);
 
     // Open file
     int file_fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -85,7 +90,7 @@ int main(int argc, char* argv[]) {
     int total = 0;
     while (total < file_size) {
         int bytes_recv = recv(client_sockfd, buffer, BUFFER_SIZE, 0);
-        printf("[client] Received %d bytes\n", (int)bytes_recv);
+        //printf("[client] Received %d bytes\n", (int)bytes_recv);
         write(file_fd, buffer, bytes_recv);
         total += bytes_recv;
     }
