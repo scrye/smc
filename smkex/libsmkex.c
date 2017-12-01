@@ -231,9 +231,11 @@ int __send_session_info(int sockfd, int ids) {
     memcpy(cursor, mp_sockets[sockfd].session.remote_pub_key,
             mp_sockets[sockfd].session.remote_pub_key_length);
 
+	/*
     printf("Session info:");
     hexdump(session, session_length);
     printf("\n");
+	*/
 
     // Allocate space for AEAD encryption of session info; using CTR so only need extra tag space
     smkex_pkt* ppkt = smkex_pkt_allocate(session_length + SESSION_TAG_LENGTH);
@@ -322,9 +324,11 @@ int __recv_check_session_info(int sockfd, int ids) {
         goto free_ppkt_recv_check_si;
     }
 
+	/*
     printf("Session info:");
     hexdump(session_info, session_info_length);
     printf("\n");
+	*/
 
     // Compare values
     unsigned char* cursor = session_info;
